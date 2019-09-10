@@ -1,0 +1,136 @@
+# Adapting this notebook to our data: https://github.com/nataliavelez/nipype_model_debug/blob/master/subject_model_debug.ipynb
+# Main reason for this is to apply fixed-effects workflow within Nipype. The other method (see 'testing_post_fMRIPrep_nipype_v2' script) was written in
+# Niype 'caching', which is different than workflows. This did not allow us to apply fixed-effects the easiest way.
+
+# Load libraries
+import os  # system functions
+import pandas as pd
+import glob
+import numpy as np
+import json
+from os.path import join as opj
+import nipype.interfaces.io as nio  # Data i/o
+import nipype.interfaces.fsl as fsl  # fsl
+from nipype.interfaces import utility as niu  # Utilities
+import nipype.pipeline.engine as pe  # pypeline engine
+import nipype.algorithms.modelgen as modelgen  # model generation
+import nipype.algorithms.rapidart as ra  # artifact detection
+from nipype.workflows.fmri.fsl import (create_featreg_preproc,
+                                       create_modelfit_workflow,
+                                       create_fixed_effects_flow)
+from nipype import config
+config.enable_debug_mode()
+
+# Project directory and function inputs
+# FOR TESTING (hard coded)
+project = 'NABM'
+subject = 'sub-0204aa'
+sub_number = subject[4:]
+task = 'cue'
+model = 'localizer' ########WHAT IS THIS-- DOES THIS APPLY TO OUR DATA
+n_runs = 2
+runs = list(range(1, n_runs+1))
+
+# Paths
+BIDS_dir = '/m/InProcess/3T/NABM/fMRI/BIDS' #BIDS location
+derivatives_dir = os.path.join(BIDS_dir,'derivatives') #fMRIPrep main folder under "derivatives"
+BIDS_func_dir = os.path.join(BIDS_dir,subject,"func") #FOR SPECIFIC SUBJECT
+fmriprep_dir = os.path.join(BIDS_func_dir, "derivatives", "fmriprep-1.3.2", "out", "fmriprep" ) #sub level of fMRIPrep folder
+#work_dir = os.path.join() # WHAT DOES THIS NEED TO BE
+results_dir = '/m/InProcess/3T/NABM/fMRI/tmp_results'
+if not os.path.exists(results_dir):
+    os.mkdir(results_dir)
+
+# Debug/ Check
+print("project directory is:", BIDS_dir)
+print("subject code is:", subject)
+print("runs:", runs)
+
+# Grab bids info. From here get task info/ files etc. ***Using BIDSLayout is an easy way to get specific files in BIDS format- use this to get regressors later***
+from bids import BIDSLayout
+layout = BIDSLayout(BIDS_dir)
+all_files = layout.get() #ALL FILES IN PROJECT DIR-->can use this to index from all, also can get metadata.
+cue_nii_file = layout.get(subject=sub_number, extensions='nii.gz', suffix='bold',task=task) #gets both, for now not used
+
+TR = 1 #Hard coding for now
+
+# Model fitting workflow
+# IdentityInterface-- iterate over subjects and runs. Sets up inputnode as Class with accessible subfields (project, subject_id, etc.)
+inputnode = pe.Node(niu.IdentityInterface(fields=['project', 'subject_id', 'task', 'model', 'run'],
+                                         mandatory_inputs=True),
+                   'inputnode')
+inputnode.iterables = [('run', runs)]
+inputnode.inputs.project = project
+inputnode.inputs.subject_id = subject
+inputnode.inputs.task = task
+inputnode.inputs.model = model
+
+# Data Grabber- Nipype way to select files from hard drive
+# Template paths for DataGrabber. Template because not hard coded and have place holders which are swapped in later (for Run, Task, Subject)
+
+func_template = os.path.join(fmriprep_dir,'%s/func/*task-%s_run-%02d_space-MNI152NLin2009cAsym_desc-preproc_bold.nii.gz')
+anat_template = os.path.join(fmriprep_dir,'%s/anat/*space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz')
+mask_template = os.path.join(fmriprep_dir,'%s/func/*task-%s_run-%02d_space-MNI152NLin2009cAsym_desc-brain_mask.nii.gz')
+confounds_template = os.path.join(fmriprep_dir,'%s/func/*task-%s_run-%02d_desc-confounds_regressors.tsv')
+model_template = os.path.join(BIDS_dir, '%s/func/*task-%s_run-%02d_events.tsv')
+contrast_template = os.path.join(BIDS_dir, '%s/func/*task-%s_run-%02d_events.tsv')#DONT KNOW WHAT THIS IS--> must edit this, placeholder for now
+
+# This creates a Node and applies the template paths above with variables
+datasource = pe.Node(nio.DataGrabber(infields=['subject_id',
+                                               'task',
+                                               'model',
+                                               'run'],
+                                     outfields=['struct',
+                                                'func',
+                                                'mask',
+                                                'confounds_file',
+                                                'events_file',
+                                                'contrasts_file']),
+                     'datasource')
+datasource.inputs.base_directory = derivatives_dir
+datasource.inputs.template = '*'
+datasource.inputs.sort_filelist = True
+datasource.inputs.field_template = dict(struct=anat_template, # Here we are applying the templates
+                                       func=func_template,
+                                       mask=mask_template,
+                                       confounds_file=confounds_template,
+                                       events_file=model_template,
+                                       contrasts_file=contrast_template)
+datasource.inputs.template_args = dict(struct=[['subject_id']], # Here we are inserting arguments into the templates (subject, task, run, etc.)
+                                      func=[['subject_id', 'task', 'run']],
+                                      mask=[['subject_id', 'task', 'run']],
+                                      confounds_file=[['subject_id', 'task', 'run']],
+                                      events_file=[['subject_id', 'task', 'model', 'run']],
+                                      contrasts_file=[['task', 'model']])
+
+# ModelGrabber -- grab model sepcification info (util)
+def ModelGrabber(contrasts_file, events_file, confounds_file):
+
+    from os import environ
+    import numpy as np
+    import pandas as pd
+    from nipype.interfaces.base import Bunch
+    from json import load as loadjson
+
+    # Project dir
+    BIDS_dir = '/m/InProcess/3T/NABM/fMRI/BIDS'  # BIDS location
+
+    # Load Data
+    read_tsv = lambda f: pd.read_csv(os.path.join(BIDS_dir, f), sep='\t', index_col=None) #lambda fx to read csv
+    model = read_tsv(events_file)
+    all_confounds = read_tsv(confounds_file) # Confounds file read as pandas df to be used later
+
+    # Confounds
+    confound_names = ['trans_x', 'trans_y', 'trans_z', 'rot_x', 'rot_y', 'rot_z',
+                      'global_signal', 'framewise_displacement', 'a_comp_cor_00', 'a_comp_cor_01',
+                      'a_comp_cor_02', 'a_comp_cor_03', 'a_comp_cor_04', 'a_comp_cor_05']
+    confounds_df = all_confounds.loc[:, confound_names]
+    confounds_df.framewise_displacement = confounds_df.framewise_displacement.fillna(0)
+    confounds_dict = confounds_df.to_dict('list')
+
+    # Convert confounds to dictionary
+    confounds = {'regressor_names': confound_names,
+                 'regressors': [confounds_dict[name] for name in confound_names]}
+
+    # Model specification
+    modelspec_dict = model.copy().rename()
