@@ -1,0 +1,336 @@
+# Adapting this notebook to our data: https://github.com/nataliavelez/nipype_model_debug/blob/master/subject_model_debug.ipynb
+# Main reason for this is to apply fixed-effects workflow within Nipype. The other method (see 'testing_post_fMRIPrep_nipype_v2' script) was written in
+# Niype 'caching', which is different than workflows. This did not allow us to apply fixed-effects the easiest way.
+
+# Load libraries
+import os  # system functions
+import pandas as pd
+import glob
+import numpy as np
+import json
+from os.path import join as opj
+import nipype.interfaces.io as nio  # Data i/o
+import nipype.interfaces.fsl as fsl  # fsl
+from nipype.interfaces import utility as niu  # Utilities
+import nipype.pipeline.engine as pe  # pypeline engine
+import nipype.algorithms.modelgen as modelgen  # model generation
+import nipype.algorithms.rapidart as ra  # artifact detection
+from nipype.workflows.fmri.fsl import (create_featreg_preproc,
+                                       create_modelfit_workflow,
+                                       create_fixed_effects_flow)
+from nipype import config
+config.enable_debug_mode()
+
+# Project directory and function inputs
+# FOR TESTING (hard coded)
+project = 'NABM'
+subject = 'sub-0204aa'
+sub_number = subject[4:]
+task = 'cue'
+#model = 'localizer' #not used, example Notebook used this to specify different models
+contrast_model = 'ContOne' # Change this if you are changing the contrasts / the model at all. Keep the old file in nipype_dir and just create a new one in same name format
+n_runs = 2
+runs = list(range(1, n_runs+1))
+
+# Paths/ Directories
+BIDS_dir = '/m/InProcess/3T/NABM/fMRI/BIDS' #BIDS location
+derivatives_dir = os.path.join(BIDS_dir,'derivatives') #fMRIPrep main folder under "derivatives"
+BIDS_func_dir = os.path.join(BIDS_dir,subject,"func") #FOR SPECIFIC SUBJECT
+fmriprep_dir = os.path.join(BIDS_func_dir, "derivatives", "fmriprep-1.3.2", "out", "fmriprep" ) #sub level of fMRIPrep folder
+nipype_dir = '/m/InProcess/3T/NABM/fMRI/Nipype_base_dir' # Where Nipype models take place
+work_dir = '/m/InProcess/3T/NABM/fMRI/Nipype_work_dir' #temp working dir for Workflow
+results_dir = '/m/InProcess/3T/NABM/fMRI/tmp_results'
+if not os.path.exists(results_dir):
+    os.mkdir(results_dir)
+
+# Debug/ Check
+print("project directory is:", BIDS_dir)
+print("subject code is:", subject)
+print("runs:", runs)
+
+# Grab bids info. From here get task info/ files etc. ***Using BIDSLayout is an easy way to get specific files in BIDS format- use this to get regressors later***
+# At this point do not use. The example Notebook uses a different method-- template files.
+from bids import BIDSLayout
+layout = BIDSLayout(BIDS_dir)
+all_files = layout.get() #ALL FILES IN PROJECT DIR-->can use this to index from all, also can get metadata.
+cue_nii_file = layout.get(subject=sub_number, extensions='nii.gz', suffix='bold',task=task) #gets both, for now not used
+
+TR = 1 #Hard coding for now, all NABM task-based are TR=1
+
+# Model fitting workflow
+# IdentityInterface-- iterate over subjects and runs. Sets up inputnode as Class with accessible subfields (project, subject_id, etc.)
+inputnode = pe.Node(niu.IdentityInterface(fields=['project', 'subject_id', 'task', 'run'],
+                                         mandatory_inputs=True),
+                   'inputnode')
+inputnode.iterables = [('run', runs)]
+inputnode.inputs.project = project
+inputnode.inputs.subject_id = subject
+inputnode.inputs.task = task
+#inputnode.inputs.model = model
+
+# Data Grabber- Nipype way to select files from hard drive
+# Template paths for DataGrabber. Template because not hard coded and have place holders which are swapped in later (for Run, Task, Subject)
+
+func_template = os.path.join(fmriprep_dir,'%s/func/*task-%s_run-%02d_space-MNI152NLin2009cAsym_desc-preproc_bold.nii.gz')
+anat_template = os.path.join(fmriprep_dir,'%s/anat/*space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz')
+mask_template = os.path.join(fmriprep_dir,'%s/func/*task-%s_run-%02d_space-MNI152NLin2009cAsym_desc-brain_mask.nii.gz')
+confounds_template = os.path.join(fmriprep_dir,'%s/func/*task-%s_run-%02d_desc-confounds_regressors.tsv')
+model_template = os.path.join(BIDS_dir, '%s/func/*task-%s_run-%02d_events.tsv')
+#contrast_template = '/m/InProcess/3T/NABM/fMRI/Nipype_base_dir/cue_contrastfile_1.json'
+contrast_template = os.path.join(nipype_dir,"contrasts", "task-%s_" + contrast_model)
+
+# This creates a Node and applies the template paths above with variables
+datasource = pe.Node(nio.DataGrabber(infields=['subject_id',
+                                               'task',
+                                               'run'],
+                                     outfields=['struct',
+                                                'func',
+                                                'mask',
+                                                'confounds_file',
+                                                'events_file',
+                                                'contrasts_file']),
+                     'datasource')
+datasource.inputs.base_directory = derivatives_dir
+datasource.inputs.template = '*'
+datasource.inputs.sort_filelist = True
+datasource.inputs.field_template = dict(struct=anat_template, # Here we are applying the templates
+                                       func=func_template,
+                                       mask=mask_template,
+                                       confounds_file=confounds_template,
+                                       events_file=model_template,
+                                       contrasts_file=contrast_template)
+datasource.inputs.template_args = dict(struct=[['subject_id']], # Here we are inserting arguments into the templates (subject, task, run, etc.)
+                                      func=[['subject_id', 'task', 'run']],
+                                      mask=[['subject_id', 'task', 'run']],
+                                      confounds_file=[['subject_id', 'task', 'run']],
+                                      events_file=[['subject_id', 'task', 'run']],
+                                      contrasts_file=[['task', 'contrast_model']])
+
+# ModelGrabber -- grab model sepcification info (util)
+def ModelGrabber(contrasts_file, events_file, confounds_file):
+
+    from os import environ
+    import numpy as np
+    import pandas as pd
+    from nipype.interfaces.base import Bunch
+    from json import load as loadjson
+
+    # Project dir
+    BIDS_dir = '/m/InProcess/3T/NABM/fMRI/BIDS'  # BIDS location
+
+    # Load Data
+    read_tsv = lambda f: pd.read_csv(os.path.join(BIDS_dir, f), sep='\t', index_col=None) #lambda fx to read csv
+    model = read_tsv(events_file)
+    all_confounds = read_tsv(confounds_file) # Confounds file read as pandas df to be used later
+
+    # Confounds
+    confound_names = ['trans_x', 'trans_y', 'trans_z', 'rot_x', 'rot_y', 'rot_z',
+                      'global_signal', 'framewise_displacement', 'a_comp_cor_00', 'a_comp_cor_01',
+                      'a_comp_cor_02', 'a_comp_cor_03', 'a_comp_cor_04', 'a_comp_cor_05']
+    confounds_df = all_confounds.loc[:, confound_names]
+    confounds_df.framewise_displacement = confounds_df.framewise_displacement.fillna(0)
+    confounds_dict = confounds_df.to_dict('list')
+
+    # Convert confounds to dictionary
+    confounds = {'regressor_names': confound_names,
+                 'regressors': [confounds_dict[name] for name in confound_names]}
+
+    # Model specification
+    modelspec_dict = model.copy().rename(index=str,
+                                         columns={'onset': 'onset',
+                                                  'duration': 'duration',
+                                                  'trial_type': 'conditions',
+                                                  'stim_file': 'stim_file',
+                                                  'pulse': 'pulse',
+                                                  'trigger' : 'trigger'
+                                                  })
+    modelspec_dict = modelspec_dict.groupby('conditions').aggregate(lambda  g: list(g)).reset_index().to_dict('list')
+    modelspec = Bunch(**modelspec_dict)
+
+    # Contrasts
+    with open(os.path.join(nipype_dir, contrasts_file), 'r') as contrast_handle:
+        contrasts = loadjson(contrast_handle)
+
+    return modelspec, contrasts
+
+# Make Node. This is where we apply everything prior into a Nipype Node. It takes in our contrasts file, events file, confounds file
+# from the function above.
+model_grabber = pe.Node(niu.Function(input_names=['contrasts_file', 'events_file', 'confounds_file'],
+                                     output_names=['modelspec', 'contrasts'],
+                                     function=ModelGrabber),
+                        'model_grabber')
+
+# Model specification
+# Nipype way to specify / initiate our model, with various standard inputs
+modelspec = pe.Node(modelgen.SpecifyModel(),
+                    'modelspc')
+modelspec.inputs.time_repetition = 1.0 # Hard coded becuase all TR = 1 for task-based NABM
+modelspec.inputs.input_units = 'secs'
+modelspec.inputs.high_pass_filter_cutoff = 128 # Standard value
+
+# Generate FEAT-specific files
+# Nipype set up Level 1 via FSL, with various standard inputs
+level1design = pe.Node(fsl.model.Level1Design(),
+                       'l1design')
+level1design.inputs.bases = {'dgamma': {'derivs': True}} # Can try double gamma here and compare to gamma
+level1design.inputs.model_serial_correlations = True
+level1design.inputs.interscan_interval = 1
+
+# FEATModel- Prepare design file for first-level model
+featmodel = pe.Node(fsl.model.FEATModel(),
+                    'featmodel')
+
+# ApplyMasmk- Prepare brainmask for modeling
+mask = pe.Node(fsl.maths.ApplyMask(),
+               'mask')
+
+# FILM- Run-specific model
+filmgls = pe.Node(fsl.FILMGLS(),
+                  'filmgls')
+
+# Helper function to sort FILM outputs
+def sort_filmgls_output(copes_grouped_by_run, varcopes_grouped_by_run):
+    def reshape_lists(files_grouped_by_run):
+        import numpy as np
+        if not isinstance(files_grouped_by_run, list):
+            files = [files_grouped_by_run]
+        else:
+            files = files_grouped_by_run
+
+        if all(len(x) == len(files[0]) for x in files): n_files = len(files[0])
+
+        all_files = np.array(files).flatten()
+        files_grouped_by_contrast = all_files.reshape(int(len(all_files) / n_files), n_files).T.tolist()
+        return files_grouped_by_contrast
+    copes_grouped_by_contrast = reshape_lists(copes_grouped_by_run)
+    varcopes_grouped_by_contrast = reshape_lists(varcopes_grouped_by_run)
+    return copes_grouped_by_contrast, varcopes_grouped_by_contrast
+
+pass_run_data = pe.Node(niu.IdentityInterface(fields= ['mask', 'dof_file', 'copes', 'varcopes']), 'pass_run_data')
+join_run_data = pe.JoinNode(niu.IdentityInterface(fields= ['masks', 'dof_files', 'copes', 'varcopes']),
+                            joinsource='inputmode', joinfield=['masks', 'dof_files', 'copes', 'varcopes'], name='join_run_data')
+
+group_by_contrast = pe.Node(niu.Function(input_names= ['copes_grouped_by_run',
+                                                       'varcopes_grouped_by_run'],
+                                         output_names= ['copes_grouped_by_contrast',
+                                                        'varcopes_grouped_by_contrast'],
+                                         function=sort_filmgls_output), name='group_by_contrast')
+
+# DataSink- specify outputs of first-level modeling workflow
+# DataSink is a way to access temp/working files in workflow
+datasink = pe.Node(nio.DataSink(),
+                   'datasink')
+datasink.inputs.base_directory = os.path.join(derivatives_dir, 'l1analysis', subject ) # subject specific folder in modeling folder WITHIN fmriprep folder
+datasource.inputs.substitutions = [('_run_', 'run-0')] #Why this step....
+
+# MergeModel- merge model ouputs for first-level model
+mergesource = pe.Node(niu.IdentityInterface(fields= ['mask', 'dof_file', 'copes', 'varcopes']),
+                      'mergesource')
+mergemodel = pe.JoinNode(niu.IdentityInterface(fields= ['mask', 'dof_file', 'copes', 'varcopes']),
+                         joinsource='mergesource',
+                         name='mergemodel')
+
+# FixedEffects workflow-- combine runs
+fixedfx = create_fixed_effects_flow()
+
+# Helper functions to sort
+def sort_copes(files):
+    numelements = len(files)
+    outfiles = []
+    for i in range(numelements):
+        outfiles.insert(i, [])
+        for j, elements in enumerate(files):
+            outfiles[i].append(elements[i])
+    return outfiles
+
+def num_copes(files):
+    return len(files)
+
+pickfirst = lambda x: x[0] # lambda fx that just takes first element of x, i.e. x[0]
+
+# l1_workflow- build and run first-level modeling workflow
+leve1_workflow = pe.Workflow('l1', base_dir=work_dir)
+
+leve1_workflow.connect([
+    # Build first-level model
+    (inputnode, datasource, [
+        ('subject_id', 'subject_id'),
+        ('task', 'task'),
+        ('model', 'model'),
+        ('run', 'run')]),
+    (inputnode, model_grabber, [
+        ('project', 'project')]),
+    (datasource, model_grabber, [
+        ('contrasts_file', 'contrasts_file'),
+        ('events_file', 'events_file'),
+        ('confounds_file', 'confounds_file')]),
+    (datasource, modelspec, [('func', 'functional_runs')]),
+    (model_grabber, modelspec, [('modelspec', 'subject_info')]),
+    (model_grabber, level1design, [('session_info', 'session_info')]),
+    (modelspec, level1design, [('session_info', 'session_info')]),
+    (level1design, featmodel, [
+        ('fsf_files', 'fsf_files'),
+        ('ev_files', 'ev_files')]),
+    (datasource, mask, [
+        ('mask', 'mask_file'),
+        ('func', 'in_file')]),
+
+    # Prepare functional data
+    (mask, filmgls, [('out_file', 'in_file')]),
+
+    # Estimate model
+    (featmodel, filmgls, [
+        ('design_file', 'design_file'),
+        ('con_file', 'tcon_file'),
+        ('fcon_file', 'fcon_file')]),
+    (datasource, pass_run_data, [('mask', 'mask')]),
+    (filmgls, pass_run_data, [
+        ('copes', 'copes'),
+        ('con_file', 'tcon_file'),
+        ('fcon_file', 'fconfile')]),
+    (datasource, pass_run_data, [('mask', 'mask')]),
+    (filmgls, pass_run_data, [
+        ('copes', 'copes'),
+        ('varcopes', 'varcopes'),
+        ('dof_file', 'dof_file'),
+        ]),
+
+    # Aggregate run across runs
+    (pass_run_data, join_run_data,[
+        ('mask', 'masks'),
+        ('dof_file', 'dof_file'),
+        ('copes', 'copes'),
+        ('varcopes', 'varcopes'),
+        ]),
+
+    # Write out model files
+    (featmodel, datasink, [('design_file', "design.@design_matrix")]),
+    (filmgls, datasink, [
+        ('zstats', "film.@zstats"),
+        ('copes', "film.@copes"),
+        ('varcopes', "film.@varcopes"),
+        ('param_estimates', "film.@parameter_estimates"),
+        ('dof_file', "film.@dof"),
+        ]),
+    # Fixed Effects model
+    (group_by_contrast, fixedfx, [
+        ('copes_grouped_by_contrast', 'inputspec.copes'),
+        ('varcopes_grouped_by_contrast', 'inputspec.varcopes'),
+    ]),
+
+    # Write out fixed effects results
+    (fixedfx, datasink, [
+        ('outputspec.res4d', "flameo.@res4d"),
+        ('outputspec.copes', "flameo.@copes"),
+        ('outputspec.varcopes', "flameo.@varcopes"),
+        ('output.zstats', "flameo.@zstats"),
+        ('outputspec.tstats', "flameo.@tstats")
+    ]),
+])
+
+#level1_workflow.run() # Run once everything is working above...
+
+level1_workflow.write_graph(graph2use='colored', format='png', simple_form=True) #making graph
+Image(filename=os.path.join(level1_workflow.base_dir, '1l', 'graph.png')) #filename of the grpah
+
+
